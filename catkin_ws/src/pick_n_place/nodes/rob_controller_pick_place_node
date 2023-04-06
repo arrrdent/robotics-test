@@ -1,0 +1,6 @@
+#!/usr/bin/env python3.8
+
+from pick_n_place import RobControllerPickPlace
+
+if __name__ == "__main__":
+    RobControllerPickPlace().main_loop()

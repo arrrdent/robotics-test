@@ -1,11 +1,9 @@
-FROM ros:noetic-ros-core-focal
+FROM ghcr.io/remyrobotics/robotics-test:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gazebo11 \
-    build-essential \
-    python3-catkin-tools \
-    python3-rosdep \
+    ros-noetic-moveit \
     && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /etc/ros/rosdep/* \
     && rosdep init \
     && rosdep update
 
@@ -18,3 +16,4 @@ RUN . /opt/ros/noetic/setup.sh \
     && cd /home/catkin_ws \
     && rosdep install --rosdistro=noetic --from-path . -y --ignore-src \
     && catkin build
+

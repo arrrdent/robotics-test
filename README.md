@@ -25,7 +25,7 @@ The gripper can be controlled through a topic:
 ### Using docker image
 
 ```bash
-$ docker pull ghcr.io/remyrobotics/robotics-test:latest
+$ docker pull ghcr.io/arrrdent/robotics-test
 $ xhost local:root
 $ docker-compose up
 ```

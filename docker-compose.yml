@@ -2,12 +2,12 @@ version: '3'
 
 services:
   ros-master:
-    image: ghcr.io/remyrobotics/robotics-test:latest
+    image: ghcr.io/arrrdent/robotics-test
     command: stdbuf -o L roscore
     network_mode: host
 
   gazebo:
-    image: ghcr.io/remyrobotics/robotics-test:latest
+    image: ghcr.io/arrrdent/robotics-test
     depends_on:
       - ros-master
     network_mode: host
@@ -22,3 +22,10 @@ services:
       - "/dev/dri/"
     command: bash -c "cd /home/catkin_ws && source devel/setup.bash && roslaunch --wait simple_scene gazebo.launch"
     runtime: nvidia
+
+  pick_n_place:
+    image: ghcr.io/arrrdent/robotics-test
+    depends_on:
+      - gazebo
+    network_mode: host
+    command: bash -c "sleep 3 && cd /home/catkin_ws && source devel/setup.bash && roslaunch --wait pick_n_place pick_n_place.launch"

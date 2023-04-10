@@ -2,16 +2,21 @@
 
 import copy
 import sys
-from math import pi, dist, fabs, sin, cos
+from math import pi, sin, cos
+from typing import List
 
 import moveit_commander
+import numpy as np
 import rospy
 import tf
 from gazebo_msgs.srv import GetModelState
-from geometry_msgs.msg import Point, Pose, PoseStamped
+from geometry_msgs.msg import Point, Pose, Quaternion
 from moveit_msgs.msg import Constraints, JointConstraint, OrientationConstraint
 from std_msgs.msg import Float64
+from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
+
+
 # from pilz_robot_programming import *
 
 # todo: add comments
@@ -28,8 +33,8 @@ class RobControllerPickPlace:
         self.get_gazebo_model_state = rospy.ServiceProxy('/gazebo/get_model_state/', GetModelState)
 
         self.gripper_pub = rospy.Publisher('/gripper_joint_position/command', Float64, queue_size=10)
-        self.joint_traj_pub = rospy.Publisher('/pos_joint_traj_controller/command', JointTrajectory, queue_size=10)
-        self.tf = tf.TransformListener()
+        # self.joint_traj_pub = rospy.Publisher('/pos_joint_traj_controller/command', JointTrajectory, queue_size=10)
+        self.tr = tf.listener.TransformerROS()
 
         self.robot = moveit_commander.RobotCommander()
         rospy.sleep(3)
@@ -118,24 +123,50 @@ class RobControllerPickPlace:
         if self._cur_block_num >= self.blocks_count:
             return False
         self._cur_block_num += 1
-        self.next_block_pick_pose = self.get_block_pose(self._cur_block_num)
-        self.next_block_place_pose = self.get_next_block_target()
+        # rotate target gripper pose to block yaw rotation
+        next_block_pose = self.get_block_pose(self._cur_block_num)
+        q_block = [next_block_pose.orientation.x, next_block_pose.orientation.y,
+                   next_block_pose.orientation.z, next_block_pose.orientation.w]
+        (r, p, y) = tf.transformations.euler_from_quaternion(q_block)
+        q_gripper_def = [self.look_down_ori.x,
+                         self.look_down_ori.y,
+                         self.look_down_ori.z,
+                         self.look_down_ori.w]
+        q_rot = tf.transformations.quaternion_from_euler(0, 0, y)
+        q_gripper_new = Quaternion(*tf.transformations.quaternion_multiply(q_rot, q_gripper_def))
+
+        self.next_block_pick_pose = Pose(next_block_pose.position, q_gripper_new)
+        self.next_block_place_pose = self.get_next_block_place_pose()
         return True
 
-    def get_next_block_target(self):
+    def get_next_block_place_pose(self, circle_pattern=True):
         block_z_offset = 0.037
-        next_block_target_pose = Pose(copy.deepcopy(self.gazebo_first_place_position), self.look_down_ori)
-        next_block_target_pose.position.x = self.gazebo_first_place_position.x + 0.2 * ((self._cur_block_num - 1) % 2)
-        next_block_target_pose.position.y = self.gazebo_first_place_position.y - 0.2 + 0.1 * (
-                (self._cur_block_num - 1) // 2)
+        next_block_target_pose = copy.deepcopy(Pose(self.gazebo_first_place_position, self.look_down_ori))
+
         next_block_target_pose.position.z = self.gazebo_first_place_position.z - self.gazebo_world_robot_position.z + block_z_offset
 
-        # todo: try some orientation patterns =)
-        # circle_part = self._cur_block_num / self.blocks_count
-        # q_rot = [0, 0, sin(pi * circle_part), cos(pi * circle_part)]
-        # q_orig = [self.look_down_ori.x, self.look_down_ori.y, self.look_down_ori.z, self.look_down_ori.w]
-        #
-        # next_block_target_pose.orientation = Quaternion(*tf.transformations.quaternion_multiply(q_rot, q_orig))
+        if circle_pattern:
+            circle_part = self._cur_block_num / self.blocks_count
+            q_rot = [0, 0, sin(pi * circle_part), cos(pi * circle_part)]
+            transfmat = self.tr.fromTranslationRotation([next_block_target_pose.position.x,
+                                                         next_block_target_pose.position.y,
+                                                         next_block_target_pose.position.z], q_rot)
+            posemat = self.tr.fromTranslationRotation([0., 0.1, 0],
+                                                      [next_block_target_pose.orientation.x,
+                                                       next_block_target_pose.orientation.y,
+                                                       next_block_target_pose.orientation.z,
+                                                       next_block_target_pose.orientation.w])
+            newmat = np.dot(transfmat, posemat)
+            xyz = tuple(newmat[:3, 3])
+            quat = tuple(tf.transformations.quaternion_from_matrix(newmat))
+
+            next_block_target_pose = Pose(Point(*xyz), Quaternion(*quat))
+        else:
+            # square pattern
+            next_block_target_pose.position.x = self.gazebo_first_place_position.x + 0.2 * (
+                    (self._cur_block_num - 1) % 2)
+            next_block_target_pose.position.y = self.gazebo_first_place_position.y - 0.2 + 0.1 * (
+                    (self._cur_block_num - 1) // 2)
 
         return next_block_target_pose
 
@@ -165,34 +196,13 @@ class RobControllerPickPlace:
             print("Service '/gazebo/get_model_state' did not process request: " + str(e))
             return None
 
-    def all_close(self, goal, actual, tolerance=0.01):
-        """
-        Convenience method for testing if the values in two lists are within a tolerance of each other.
-        For Pose and PoseStamped inputs, the angle between the two quaternions is compared (the angle
-        between the identical orientations q and -q is calculated correctly).
-        @param: goal       A list of floats, a Pose or a PoseStamped
-        @param: actual     A list of floats, a Pose or a PoseStamped
-        @param: tolerance  A float
-        @returns: bool
-        """
-        if type(goal) is list:
-            for index in range(len(goal)):
-                if abs(actual[index] - goal[index]) > tolerance:
-                    return False
+    def open_gripper(self, wait_time=0.5):
+        self.gripper_pub.publish(Float64(0.1))
+        rospy.sleep(wait_time)
 
-        elif type(goal) is PoseStamped:
-            return self.all_close(goal.pose, actual.pose, tolerance)
-
-        elif type(goal) is Pose:
-            x0, y0, z0, qx0, qy0, qz0, qw0 = moveit_commander.conversions.pose_to_list(actual)
-            x1, y1, z1, qx1, qy1, qz1, qw1 = moveit_commander.conversions.pose_to_list(goal)
-            # Euclidean distance
-            d = dist((x1, y1, z1), (x0, y0, z0))
-            # phi = angle between orientations
-            cos_phi_half = fabs(qx0 * qx1 + qy0 * qy1 + qz0 * qz1 + qw0 * qw1)
-            return d <= tolerance and cos_phi_half >= cos(tolerance / 2.0)
-
-        return True
+    def close_gripper(self, wait_time=0.5):
+        self.gripper_pub.publish(Float64(-0.3))
+        rospy.sleep(wait_time)
 
     def go_home(self):
         if self.arm is None:
@@ -202,21 +212,32 @@ class RobControllerPickPlace:
         self.arm.stop()
         return success
 
-    def open_gripper(self, wait_time=0.5):
-        self.gripper_pub.publish(Float64(0.1))
-        rospy.sleep(wait_time)
+    def movej(self, goal_pose_j):
+        self.arm.set_start_state(self.robot.get_current_state())
+        success = self.arm.go(goal_pose_j, wait=True)
+        return success
 
-    def close_gripper(self, wait_time=0.5):
-        self.gripper_pub.publish(Float64(-0.3))
-        rospy.sleep(wait_time)
+    def movel(self, goal_waypoints: List[Pose]):
+        cur_rob_state = self.robot.get_current_state()
+        self.arm.set_start_state(cur_rob_state)
+        (plan, fraction) = self.arm.compute_cartesian_path(
+            goal_waypoints,
+            0.01,  # eef_step
+            0.0,  # jump_threshold
+            avoid_collisions=True,
+            path_constraints=self.path_constraints)
+        success = False
+        if fraction > 0.9:
+            plan = self.arm.retime_trajectory(cur_rob_state, plan,
+                                              algorithm="time_optimal_trajectory_generation")
+            success = self.arm.execute(plan, wait=True)
+        return success
 
     def pick_n_place(self, block_pick_pose, block_place_pose, approach_z=0.06, deapproach_z=0.06):
         if self.arm is None:
             return False
-        cur_pose = copy.deepcopy(self.arm.get_current_pose().pose)
 
-        pick_p = copy.deepcopy(block_pick_pose)
-        pick_p.orientation = copy.deepcopy(cur_pose.orientation)
+        pick_p = block_pick_pose
 
         appr_pick_p = copy.deepcopy(pick_p)
         appr_pick_p.position.z += approach_z
@@ -224,27 +245,39 @@ class RobControllerPickPlace:
         deappr_pick_p = copy.deepcopy(pick_p)
         deappr_pick_p.position.z += deapproach_z
 
-        place_p = copy.deepcopy(block_place_pose)
-        place_p.orientation = self.look_down_ori
+        place_p = block_place_pose
 
         appr_place_p = copy.deepcopy(place_p)
         appr_place_p.position.z += approach_z
-        appr_place_p.orientation = copy.deepcopy(cur_pose.orientation)
 
         deappr_place_p = copy.deepcopy(place_p)
         deappr_place_p.position.z += deapproach_z
-        deappr_place_p.orientation = copy.deepcopy(cur_pose.orientation)
 
         self.open_gripper(0)
+
+        # construct moves and action sequence
         pathes_n_actions = [
-            {"path": [self.above_table1_pose_j, appr_pick_p, pick_p],
+            {"path": [appr_pick_p, pick_p],
              "action": self.close_gripper,
+             "move_type": "movel"},
+
+            {"path": [deappr_pick_p],
+             "action": None,
+             "move_type": "movel"},
+
+            {"path": [self.home_pose_j],
+             "action": None,
              "move_type": "movej"},
-            {"path": [deappr_pick_p, self.above_table1_pose_j, self.home_pose_j, self.above_table2_pose_j, appr_place_p,
-                      place_p],
+
+            {"path": [appr_place_p, place_p],
              "action": self.open_gripper,
-             "move_type": "movej"},
-            {"path": [deappr_place_p, self.above_table2_pose_j, self.home_pose_j],
+             "move_type": "movel"},
+
+            {"path": [deappr_place_p],
+             "action": None,
+             "move_type": "movel"},
+
+            {"path": [self.home_pose_j],
              "action": None,
              "move_type": "movej"}
         ]
@@ -252,48 +285,21 @@ class RobControllerPickPlace:
         for path_n_action in pathes_n_actions:
             if path_n_action["move_type"] in ["movej"]:
                 # movej
+                # todo: construct Trajectory without stops with pilz_industrial_motion_planner
                 for goal in path_n_action["path"]:
-                    success = self.arm.go(goal, wait=True)
-                    if not success:
-                        print("Can't find the path, please check configuration")
+                    if not self.movej(goal):
+                        print("Can't find joint path, please check configuration")
                         self.open_gripper()
                         self.go_home()
                         return False
             else:
                 # movel, cartesian
-                (plan, fraction) = self.arm.compute_cartesian_path(
-                    path_n_action["path"],
-                    0.05,  # eef_step
-                    0.0,
-                    avoid_collisions=True,
-                    path_constraints=self.path_constraints)  # jump_threshold
-
-                success = False
-                if fraction > 0.9:
-                    self.joint_traj_pub.publish(plan.joint_trajectory)
-                    # success = self.arm.execute(plan, wait=True)
-                    while not self.all_close(self.arm.get_current_pose().pose, path_n_action["path"][-1]):
-                        rospy.sleep(10.)
-                    # self.arm.stop()
-                if not success:
-                    print("low fraction")
+                # try plan whole path with few waypoints
+                if not self.movel(path_n_action["path"]):
+                    # try plan waypoints one by one
                     for goal in path_n_action["path"]:
-                        (plan, fraction) = self.arm.compute_cartesian_path(
-                            [copy.deepcopy(self.arm.get_current_pose().pose), goal],
-                            0.01,  # eef_step
-                            0.0)  # jump_threshold
-
-                        if fraction > 0.9:
-                            print("fraction is ok")
-                            # success = self.arm.execute(plan, wait=True)
-                            self.joint_traj_pub.publish(plan.joint_trajectory)
-                            while not self.all_close(self.arm.get_current_pose().pose, goal):
-                                rospy.sleep(10.)
-                            # self.joint_traj_pub.publish(JointTrajectory())
-                            # self.arm.stop()
-                        else:
-                            print("low fraction, try movej")
-                            self.arm.go(goal, wait=True)
+                        if not self.movel([goal]):
+                            print("Can't find linear path, please check configuration")
 
             if path_n_action["action"] is not None:
                 path_n_action["action"]()

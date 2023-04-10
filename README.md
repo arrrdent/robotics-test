@@ -35,6 +35,8 @@ Alternatively, you can build manually with the given Dockerfile.
 ### Building from Source
 
 ```bash
+$ git clone https://github.com/arrrdent/robotics-test
+$ cd robotics-test
 $ ./build.sh
 $ cd catkin_ws
 $ catkin build
@@ -43,7 +45,7 @@ $ catkin build
 Then start roscore in first terminal
 ```bash
 $ source devel/setup.bash
-$ roslaunch simple_scene gazebo.launch
+$ roscore
 ```
 
 launch gazebo scene in second terminal
@@ -55,7 +57,7 @@ $ roslaunch simple_scene gazebo.launch
 and launch pick and place controller in third terminal
 ```bash
 $ source devel/setup.bash
-$ roslaunch roslaunch pick_n_place pick_n_place.launch
+$ roslaunch pick_n_place pick_n_place.launch
 ```
 
 ## Submission

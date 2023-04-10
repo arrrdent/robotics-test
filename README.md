@@ -27,7 +27,7 @@ The gripper can be controlled through a topic:
 ```bash
 $ docker pull ghcr.io/arrrdent/robotics-test
 $ xhost local:root
-$ docker-compose up
+$ docker compose up
 ```
 
 Alternatively, you can build manually with the given Dockerfile.

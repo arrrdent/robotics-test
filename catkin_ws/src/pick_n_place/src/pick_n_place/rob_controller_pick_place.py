@@ -11,15 +11,13 @@ import rospy
 import tf
 from gazebo_msgs.srv import GetModelState
 from geometry_msgs.msg import Point, Pose, Quaternion
-from moveit_msgs.msg import Constraints, JointConstraint, OrientationConstraint
+from moveit_msgs.msg import Constraints, JointConstraint, OrientationConstraint, RobotTrajectory, RobotState
 from std_msgs.msg import Float64
 from sensor_msgs.msg import JointState
-from trajectory_msgs.msg import JointTrajectory
 
-
+# todo: compare with pilz
 # from pilz_robot_programming import *
 
-# todo: add comments
 class RobControllerPickPlace:
     def __init__(self):
         moveit_commander.roscpp_initialize(sys.argv)
@@ -119,6 +117,7 @@ class RobControllerPickPlace:
 
         return constraints
 
+    ### GAZEBO world section ###
     def try_get_next_block(self):
         if self._cur_block_num >= self.blocks_count:
             return False
@@ -196,6 +195,7 @@ class RobControllerPickPlace:
             print("Service '/gazebo/get_model_state' did not process request: " + str(e))
             return None
 
+    ### SIMPLE ACTIONS
     def open_gripper(self, wait_time=0.5):
         self.gripper_pub.publish(Float64(0.1))
         rospy.sleep(wait_time)
@@ -210,29 +210,112 @@ class RobControllerPickPlace:
         self.arm.clear_pose_targets()
         success = self.arm.go(self.home_pose_j, wait=True)
         self.arm.stop()
+        self.arm.set_start_state_to_current_state()
         return success
 
-    def movej(self, goal_pose_j):
-        self.arm.set_start_state(self.robot.get_current_state())
-        success = self.arm.go(goal_pose_j, wait=True)
-        return success
+    ### PLANNING HELPER METHODS
+    def robot_state_from_pose(self, pose):
+        js = JointState()
+        js.name = self.joint_names
+        js.position = pose
+        moveit_robot_state = RobotState()
+        moveit_robot_state.joint_state = js
+        return moveit_robot_state
 
-    def movel(self, goal_waypoints: List[Pose]):
-        cur_rob_state = self.robot.get_current_state()
-        self.arm.set_start_state(cur_rob_state)
+    def append_points_to_traj(self, traj1: RobotTrajectory, traj2: RobotTrajectory):
+        if len(traj1.joint_trajectory.points) == 0:
+            traj1 = traj2
+        else:
+            traj1.joint_trajectory.points += traj2.joint_trajectory.points
+        return traj1
+
+    ### PLANNER METHODS
+    def mixed_traj_j(self, waypoints_list, execute=True):
+        # waypoints list can be mixed (points or poses)
+        # method calc and execute trajectory if execute == True
+        # start state must be correctly setted!
+        if execute:
+            cur_rob_state = self.robot.get_current_state()
+            self.arm.set_start_state(cur_rob_state)
+
+        concatenated_plan = RobotTrajectory()
+        for p in waypoints_list:
+            if type(p) is Pose:
+                (success, plan, time, err) = self.arm.plan(p)
+                if not success:
+                    return (False, None)
+                moveit_robot_state = self.robot_state_from_pose(plan.joint_trajectory.points[-1].positions)
+            else:
+                # list of joint positions
+                js = JointState()
+                js.name = self.joint_names
+                js.position = p
+                (success, plan, time, err) = self.arm.plan(js)
+                if not success:
+                    return (False, None)
+                moveit_robot_state = RobotState()
+                moveit_robot_state.joint_state = js
+
+            self.arm.set_start_state(moveit_robot_state)
+            concatenated_plan = self.append_points_to_traj(concatenated_plan, plan)
+
+        if execute:
+            time_optimized_plan = self.arm.retime_trajectory(cur_rob_state, concatenated_plan,
+                                                             algorithm="time_optimal_trajectory_generation")
+            success = self.arm.execute(time_optimized_plan, wait=True)
+            return (success, time_optimized_plan)
+
+        return (success, concatenated_plan)
+
+    def movel(self, goal_waypoints: List[Pose], execute=True):
+        if execute:
+            cur_rob_state = self.robot.get_current_state()
+            self.arm.set_start_state(cur_rob_state)
+
         (plan, fraction) = self.arm.compute_cartesian_path(
             goal_waypoints,
             0.01,  # eef_step
             0.0,  # jump_threshold
             avoid_collisions=True,
             path_constraints=self.path_constraints)
+        moveit_robot_state = self.robot_state_from_pose(plan.joint_trajectory.points[-1].positions)
+        self.arm.set_start_state(moveit_robot_state)
         success = False
         if fraction > 0.9:
-            plan = self.arm.retime_trajectory(cur_rob_state, plan,
-                                              algorithm="time_optimal_trajectory_generation")
-            success = self.arm.execute(plan, wait=True)
-        return success
+            success = True
+            if execute:
+                plan = self.arm.retime_trajectory(cur_rob_state, plan,
+                                                  algorithm="time_optimal_trajectory_generation")
+                success = self.arm.execute(plan, wait=True)
+        return (success, plan)
 
+    def execute_pathes_n_actions(self, pathes_n_actions):
+        # concat waypoints while action is None
+        # execute concatenated path and action when action is not None
+        concatenated_plan = RobotTrajectory()
+        for sub_path_act in pathes_n_actions:
+            if sub_path_act["move_type"] == "movel":
+                (success, plan) = self.movel(sub_path_act["path"], False)
+            else:
+                (success, plan) = self.mixed_traj_j(sub_path_act["path"], False)
+            if not success:
+                print("Can't plan path for block ", self._cur_block_num)
+                return False
+            concatenated_plan = self.append_points_to_traj(concatenated_plan, plan)
+            if sub_path_act["action"] is not None:
+                cur_rob_state = self.robot.get_current_state()
+                time_optimized_plan = self.arm.retime_trajectory(cur_rob_state, concatenated_plan,
+                                                                 algorithm="time_optimal_trajectory_generation")
+                self.arm.set_start_state_to_current_state()
+                success = self.arm.execute(time_optimized_plan, wait=True)
+                if not success:
+                    return False
+                sub_path_act["action"]()
+                self.arm.set_start_state_to_current_state()
+                concatenated_plan = RobotTrajectory()
+        return True
+
+    ### METHOD WITH TASK SEQUENCE CONSTRUCTION AND EXECUTION
     def pick_n_place(self, block_pick_pose, block_place_pose, approach_z=0.06, deapproach_z=0.06):
         if self.arm is None:
             return False
@@ -257,7 +340,11 @@ class RobControllerPickPlace:
 
         # construct moves and action sequence
         pathes_n_actions = [
-            {"path": [appr_pick_p, pick_p],
+            {"path": [self.above_table1_pose_j, appr_pick_p],
+             "action": None,
+             "move_type": "movej"},
+
+            {"path": [pick_p],
              "action": self.close_gripper,
              "move_type": "movel"},
 
@@ -265,11 +352,11 @@ class RobControllerPickPlace:
              "action": None,
              "move_type": "movel"},
 
-            {"path": [self.home_pose_j],
+            {"path": [self.home_pose_j, self.above_table2_pose_j, appr_place_p],
              "action": None,
              "move_type": "movej"},
 
-            {"path": [appr_place_p, place_p],
+            {"path": [place_p],
              "action": self.open_gripper,
              "move_type": "movel"},
 
@@ -278,31 +365,14 @@ class RobControllerPickPlace:
              "move_type": "movel"},
 
             {"path": [self.home_pose_j],
-             "action": None,
+             "action": self.arm.set_start_state_to_current_state,  # add zero action for execution
              "move_type": "movej"}
         ]
 
-        for path_n_action in pathes_n_actions:
-            if path_n_action["move_type"] in ["movej"]:
-                # movej
-                # todo: construct Trajectory without stops with pilz_industrial_motion_planner
-                for goal in path_n_action["path"]:
-                    if not self.movej(goal):
-                        print("Can't find joint path, please check configuration")
-                        self.open_gripper()
-                        self.go_home()
-                        return False
-            else:
-                # movel, cartesian
-                # try plan whole path with few waypoints
-                if not self.movel(path_n_action["path"]):
-                    # try plan waypoints one by one
-                    for goal in path_n_action["path"]:
-                        if not self.movel([goal]):
-                            print("Can't find linear path, please check configuration")
-
-            if path_n_action["action"] is not None:
-                path_n_action["action"]()
+        if not self.execute_pathes_n_actions(pathes_n_actions):
+            self.open_gripper()
+            self.go_home()
+            return False
         return True
 
     def main_loop(self):
